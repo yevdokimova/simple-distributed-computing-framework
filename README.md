@@ -84,6 +84,6 @@ amount	name
 4. Accessing Client Containers:  
 _To interact with a Client, attach to its container:_  
 ``docker-compose exec client bash``  
-Once inside the container, run the Client application:_  
+_Once inside the container, run the Client application:_  
 ``python client.py``
 
