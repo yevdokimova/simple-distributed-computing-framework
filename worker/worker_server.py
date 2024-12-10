@@ -9,7 +9,7 @@ from common.dataframe import DataFrame
 from common.logger import setup_logger
 import uuid
 
-HEARTBEAT_INTERVAL = 5  # seconds
+HEARTBEAT_INTERVAL = 5
 
 logger = setup_logger('WorkerServer')
 
@@ -21,6 +21,7 @@ class WorkerServer:
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.lock = threading.Lock()
         self.running = True
+        self.connect_to_master()
 
     def connect_to_master(self):
         attempts = 0
@@ -29,8 +30,8 @@ class WorkerServer:
                 self.sock.connect((self.master_host, self.master_port))
                 logger.info(f"Connected to Master at {self.master_host}:{self.master_port}")
                 self.register_with_master()
-                threading.Thread(target=self.send_heartbeats, daemon=True).start()
-                self.listen_for_tasks()
+                threading.Thread(target=self.send_heartbeat, daemon=True).start()
+                threading.Thread(target=self.listen_for_tasks, daemon=True).start()
                 break
             except Exception as e:
                 attempts += 1
@@ -48,13 +49,15 @@ class WorkerServer:
         self.send_message(message)
         logger.info(f"Registered with Master as Worker ID: {self.worker_id}")
 
-    def send_heartbeats(self):
+    def send_heartbeat(self):
         while self.running:
-            heartbeat = {
-                "type": "heartbeat",
-                "worker_id": self.worker_id
-            }
-            self.send_message(heartbeat)
+            if self.connected():
+                heartbeat = {
+                    "type": "heartbeat",
+                    "worker_id": self.worker_id
+                }
+                self.send_message(heartbeat)
+                logger.debug(f"WorkerServer: Sent heartbeat from Worker {self.worker_id}")
             time.sleep(HEARTBEAT_INTERVAL)
 
     def listen_for_tasks(self):
@@ -92,20 +95,32 @@ class WorkerServer:
 
     def execute_task(self, task: Task):
         logger.info(f"Executing Task {task.task_id} of type {task.operation}")
-        result = task.execute()
-        response = {
-            "type": "result",
-            "task_id": result.task_id,
-            "success": result.success,
-        }
-        if result.success:
-            response["data_frame"] = {
-                "rows": result.data_frame.rows
+        try:
+            result = task.execute()
+            response = {
+                "type": "result",
+                "task_id": result.task_id,
+                "worker_id": self.worker_id,
+                "success": result.success,
             }
-        else:
-            response["error_message"] = result.error_message
-        self.send_message(response)
-        logger.info(f"Task {task.task_id} execution {'succeeded' if result.success else 'failed'}")
+            if result.success:
+                response["data_frame"] = {
+                    "rows": result.data_frame.rows
+                }
+            else:
+                response["error_message"] = result.error_message
+            self.send_message(response)
+            logger.info(f"Task {task.task_id} execution {'succeeded' if result.success else 'failed'}")
+        except Exception as e:
+            logger.error(f"WorkerServer: Error executing Task {task.task_id}: {e}")
+            response = {
+                "type": "result",
+                "task_id": task.task_id,
+                "worker_id": self.worker_id,
+                "success": False,
+                "error_message": str(e)
+            }
+            self.send_message(response)
 
     def send_message(self, message: dict):
         try:
@@ -115,6 +130,13 @@ class WorkerServer:
         except Exception as e:
             logger.error(f"Failed to send message: {e}")
 
+    def connected(self) -> bool:
+        try:
+            self.sock.getpeername()
+            return True
+        except:
+            return False
+
     def stop(self):
         self.running = False
         self.sock.close()
@@ -123,7 +145,11 @@ def main():
     master_host = 'master'
     master_port = 5000
     worker = WorkerServer(master_host, master_port)
-    worker.connect_to_master()
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        worker.stop()
 
 if __name__ == "__main__":
     main()

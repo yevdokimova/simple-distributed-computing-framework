@@ -9,8 +9,8 @@ from common.result import Result
 from common.dataframe import DataFrame
 from common.logger import setup_logger
 
-HEARTBEAT_INTERVAL = 5  # seconds
-HEARTBEAT_TIMEOUT = 15  # seconds
+HEARTBEAT_INTERVAL = 5
+HEARTBEAT_TIMEOUT = 15
 
 logger = setup_logger('MasterServer')
 
@@ -31,14 +31,19 @@ class WorkerHandler:
                 "task": json.loads(serialized_task)
             }
             self.conn.sendall((json.dumps(message) + "\n").encode())
-            self.is_busy = True
+            with self.lock:
+                self.is_busy = True
             logger.info(f"Sent Task {task.task_id} to Worker {self.worker_id}")
         except Exception as e:
-            logger.error(f"Failed to send Task to Worker {self.worker_id}: {e}")
+            logger.error(f"Failed to send Task {task.task_id} to Worker {self.worker_id}: {e}")
             self.conn.close()
 
     def update_heartbeat(self):
         self.last_heartbeat = time.time()
+
+    def mark_available(self):
+        with self.lock:
+            self.is_busy = False
 
 class MasterServer:
     def __init__(self, host='0.0.0.0', port=5000):
@@ -54,6 +59,9 @@ class MasterServer:
         self.client_sockets: Dict[str, socket.socket] = {}
         self.results: Dict[str, Result] = {}
         self.results_lock = threading.Lock()
+        self.task_retries: Dict[str, int] = {}
+        self.max_retries = 3
+        self.retry_delay = 2
         self.heartbeat_thread = threading.Thread(target=self.monitor_heartbeats, daemon=True)
         self.dispatcher_thread = threading.Thread(target=self.dispatch_tasks, daemon=True)
 
@@ -77,6 +85,7 @@ class MasterServer:
                     data = conn.recv(1024).decode()
                     if not data:
                         logger.info(f"Connection closed by {addr}")
+                        self.remove_worker(conn)
                         break
                     buffer += data
                     while '\n' in buffer:
@@ -84,6 +93,7 @@ class MasterServer:
                         self.process_message(line, conn)
                 except Exception as e:
                     logger.error(f"Error handling connection from {addr}: {e}")
+                    self.remove_worker(conn)
                     break
 
     def process_message(self, message: str, conn: socket.socket):
@@ -92,33 +102,55 @@ class MasterServer:
             msg_type = msg.get("type")
             if msg_type == "register_worker":
                 worker_id = msg.get("worker_id")
+                if not worker_id:
+                    logger.error("Received register_worker without worker_id")
+                    return
                 with self.workers_lock:
+                    for worker in self.workers:
+                        if worker.worker_id == worker_id:
+                            logger.warning(f"Worker {worker_id} is already registered")
+                            return
                     worker = WorkerHandler(worker_id, conn, conn.getpeername())
                     self.workers.append(worker)
                 logger.info(f"Registered Worker {worker_id} from {conn.getpeername()}")
+
             elif msg_type == "heartbeat":
                 worker_id = msg.get("worker_id")
+                if not worker_id:
+                    logger.error("Received heartbeat without worker_id")
+                    return
                 with self.workers_lock:
                     for worker in self.workers:
                         if worker.worker_id == worker_id:
                             worker.update_heartbeat()
                             logger.debug(f"Heartbeat received from Worker {worker_id}")
                             break
+                    else:
+                        logger.warning(f"Received heartbeat from unknown Worker {worker_id}")
+
             elif msg_type == "submit_task":
                 task_data = msg.get("task")
+                if not task_data:
+                    logger.error("Received submit_task without task data")
+                    return
                 task = SerializationUtil.deserialize_task(json.dumps(task_data))
                 with self.task_queue_lock:
                     self.task_queue.append(task)
                 client_socket = conn
                 self.client_sockets[task.task_id] = client_socket
                 logger.info(f"Received Task {task.task_id} of type {task.operation} from Client")
+
             elif msg_type == "result":
                 task_id = msg.get("task_id")
+                worker_id = msg.get("worker_id")
                 success = msg.get("success")
+                if not task_id or not worker_id:
+                    logger.error("Received result without task_id or worker_id")
+                    return
                 if success:
                     data_frame = DataFrame.from_json(json.dumps(msg.get("data_frame")))
                     result = Result(task_id, data_frame, True)
-                    logger.info(f"Received successful Result for Task {task_id} from Worker")
+                    logger.info(f"Received successful Result for Task {task_id} from Worker {worker_id}")
                 else:
                     error_message = msg.get("error_message")
                     result = Result(task_id, None, False, error_message)
@@ -142,6 +174,18 @@ class MasterServer:
                         logger.error(f"Failed to send Result to Client for Task {task_id}: {e}")
                     finally:
                         del self.client_sockets[task_id]
+
+                with self.workers_lock:
+                    for worker in self.workers:
+                        if worker.worker_id == worker_id:
+                            worker.mark_available()
+                            logger.info(f"Worker {worker_id} is now available")
+                            break
+
+                with self.task_queue_lock:
+                    if task_id in self.task_retries:
+                        del self.task_retries[task_id]
+
             else:
                 logger.warning(f"Unknown message type: {msg_type}")
         except json.JSONDecodeError:
@@ -158,13 +202,28 @@ class MasterServer:
                 task = self.task_queue.pop(0)
             worker = self.get_next_available_worker()
             if worker:
-                worker.send_task(task)
-                serialized_task = SerializationUtil.serialize_task(task)
-                logger.debug(f"Sending Task {task.task_id} to Worker {worker.worker_id}: {serialized_task}")
+                try:
+                    worker.send_task(task)
+                except Exception as e:
+                    logger.error(f"Failed to send Task {task.task_id} to Worker {worker.worker_id}: {e}")
+                    with self.task_queue_lock:
+                        retries = self.task_retries.get(task.task_id, 0)
+                        if retries < self.max_retries:
+                            self.task_retries[task.task_id] = retries + 1
+                            self.task_queue.append(task)
+                            logger.info(f"Re-enqueued Task {task.task_id} (Retry {retries + 1})")
+                        else:
+                            logger.error(f"Task {task.task_id} exceeded max retries. Discarding.")
             else:
                 with self.task_queue_lock:
-                    self.task_queue.append(task)
-                time.sleep(1)
+                    retries = self.task_retries.get(task.task_id, 0)
+                    if retries < self.max_retries:
+                        self.task_retries[task.task_id] = retries + 1
+                        self.task_queue.append(task)
+                        logger.info(f"Re-enqueued Task {task.task_id} (Retry {retries + 1})")
+                    else:
+                        logger.error(f"Task {task.task_id} exceeded max retries. Discarding.")
+                time.sleep(self.retry_delay)
 
     def get_next_available_worker(self) -> Optional[WorkerHandler]:
         with self.workers_lock:
@@ -188,6 +247,14 @@ class MasterServer:
                         logger.warning(f"Worker {worker.worker_id} timed out. Removing from active Workers.")
                         worker.conn.close()
                         self.workers.remove(worker)
+
+    def remove_worker(self, conn: socket.socket):
+        with self.workers_lock:
+            for worker in self.workers:
+                if worker.conn == conn:
+                    logger.info(f"Removing Worker {worker.worker_id}")
+                    self.workers.remove(worker)
+                    break
 
 def main():
     master = MasterServer(host='0.0.0.0', port=5000)

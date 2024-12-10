@@ -1,7 +1,9 @@
 import socket
 import threading
 import json
+import uuid
 import time
+from typing import Dict
 from common.serialization import SerializationUtil
 from common.task import Task, JoinTask, DistinctTask, GroupCountTask, GroupSumTask, OrderByTask
 from common.result import Result
@@ -21,14 +23,15 @@ class Client:
         self.connected = threading.Event()
 
     def connect_to_master(self):
-        try:
-            self.sock.connect((self.master_host, self.master_port))
-            logger.info(f"Connected to Master at {self.master_host}:{self.master_port}")
-            self.connected.set()
-            threading.Thread(target=self.listen_for_results, daemon=True).start()
-        except Exception as e:
-            logger.error(f"Failed to connect to Master: {e}")
-            self.sock.close()
+        while not self.connected.is_set() and self.running:
+            try:
+                self.sock.connect((self.master_host, self.master_port))
+                logger.info(f"Connected to Master at {self.master_host}:{self.master_port}")
+                self.connected.set()
+                threading.Thread(target=self.listen_for_results, daemon=True).start()
+            except Exception as e:
+                logger.error(f"Failed to connect to Master: {e}")
+                time.sleep(5)
 
     def submit_task(self, task: Task):
         if not self.connected.is_set():
@@ -43,7 +46,7 @@ class Client:
 
     def listen_for_results(self):
         buffer = ""
-        while self.running:
+        while self.running and self.connected.is_set():
             try:
                 data = self.sock.recv(1024).decode()
                 if not data:
@@ -75,9 +78,9 @@ class Client:
                 result = Result(task_id, None, False, error_message)
                 logger.warning(f"Task {task_id} failed with error: {error_message}")
         except json.JSONDecodeError:
-            logger.error("Failed to decode JSON message")
+            logger.error("Failed to decode JSON message from Master")
         except Exception as e:
-            logger.error(f"Error processing message: {e}")
+            logger.error(f"Error processing message from Master: {e}")
 
     def send_message(self, message: dict):
         try:
