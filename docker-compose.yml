@@ -1,0 +1,53 @@
+version: '3.8'
+
+services:
+  master:
+    build:
+      context: .
+      dockerfile: master/Dockerfile
+    ports:
+      - "5000:5000"
+    networks:
+      - distributed-net
+
+  worker1:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    depends_on:
+      - master
+    networks:
+      - distributed-net
+
+  worker2:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    depends_on:
+      - master
+    networks:
+      - distributed-net
+  
+  worker3:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    depends_on:
+      - master
+    networks:
+      - distributed-net
+
+  client:
+    build:
+      context: .
+      dockerfile: client/Dockerfile
+    depends_on:
+      - master
+    networks:
+      - distributed-net
+    stdin_open: true 
+    tty: true 
+
+networks:
+  distributed-net:
+    driver: bridge
